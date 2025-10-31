@@ -1,0 +1,316 @@
+esphome:
+  name: esphome-web-8a7574
+  friendly_name: Smart Vent Controller
+  min_version: 2025.9.0
+  name_add_mac_suffix: false
+
+esp32:
+  variant: esp32
+  framework:
+    type: esp-idf
+
+logger:
+  level: INFO
+
+api:
+
+ota:
+  - platform: esphome
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  power_save_mode: NONE
+  fast_connect: true
+  reboot_timeout: 0s
+  output_power: 20dB
+  
+  ap:
+    ssid: "VentControl Fallback"
+    password: "ventcontrol123"
+
+i2c:
+  sda: GPIO21
+  scl: GPIO22
+  scan: true
+  id: bus_a
+
+globals:
+  - id: ROOM_ALTITUDE
+    type: float
+    restore_value: no
+    initial_value: "323.0"
+  
+  - id: speed_before_night
+    type: int
+    restore_value: yes
+    initial_value: "0"
+  
+  - id: speed_before_turbo
+    type: int
+    restore_value: yes
+    initial_value: "0"
+
+  - id: pressure_1h_ago
+    type: float
+    restore_value: yes
+    initial_value: "0.0"
+
+sensor:
+  - platform: dht
+    pin: GPIO27
+    model: DHT11
+    temperature:
+      name: "Room Temperature"
+      id: room_temp
+      accuracy_decimals: 1
+      icon: "mdi:thermometer"
+      internal: true
+    humidity:
+      name: "Room Humidity"
+      id: room_humidity
+      accuracy_decimals: 1
+      icon: "mdi:water-percent"
+      filters:
+        - heartbeat: 60s
+    update_interval: 15s
+
+  - platform: bmp085
+    temperature:
+      name: "BMP180 Temperature"
+      id: bmp_temp
+      accuracy_decimals: 1
+      internal: true
+    pressure:
+      name: "Atmospheric Pressure"
+      id: atm_pressure
+      accuracy_decimals: 1
+      unit_of_measurement: "hPa"
+      device_class: atmospheric_pressure
+      state_class: measurement
+      filters:
+        - heartbeat: 300s
+    address: 0x77
+    update_interval: 60s
+
+  - platform: template
+    name: "Average Temperature"
+    id: avg_temp
+    unit_of_measurement: "°C"
+    icon: "mdi:thermometer"
+    accuracy_decimals: 1
+    device_class: temperature
+    state_class: measurement
+    lambda: |-
+      float dht = id(room_temp).state;
+      float bmp = id(bmp_temp).state;
+      if (isnan(dht) && isnan(bmp)) return NAN;
+      if (isnan(dht)) return bmp;
+      if (isnan(bmp)) return dht;
+      return (dht + bmp) / 2.0;
+    update_interval: 60s
+
+  - platform: template
+    name: "Sea Level Pressure"
+    id: sea_pressure
+    unit_of_measurement: "hPa"
+    icon: "mdi:gauge"
+    accuracy_decimals: 1
+    state_class: measurement
+    lambda: |-
+      float p = id(atm_pressure).state;
+      float h = id(ROOM_ALTITUDE);
+      float t = id(avg_temp).state + 273.15;
+      if (isnan(p) || isnan(t)) return NAN;
+      return p * pow(1.0 + (0.0065 * h / t), 5.255);
+    update_interval: 60s
+
+  - platform: template
+    name: "Pressure Trend 1h"
+    id: pressure_trend_1h
+    unit_of_measurement: "hPa/h"
+    accuracy_decimals: 2
+    state_class: measurement
+    lambda: |-
+      float current = id(atm_pressure).state;
+      float old = id(pressure_1h_ago);
+      if (isnan(current) || old <= 0.0) return 0.0;
+      return current - old;
+    update_interval: 60s
+
+output:
+  - platform: ledc
+    pin: GPIO14
+    frequency: 25000 Hz
+    id: vent_pwm
+    min_power: 0.0
+    max_power: 1.0
+    zero_means_zero: true
+
+fan:
+  - platform: speed
+    output: vent_pwm
+    name: "Ventilation Fan"
+    id: vent_fan
+    restore_mode: RESTORE_DEFAULT_OFF
+    speed_count: 100
+
+switch:
+  - platform: template
+    name: "Night Mode"
+    id: night_mode
+    icon: "mdi:weather-night"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    turn_on_action:
+      - lambda: |-
+          ESP_LOGI("night_mode", "Night mode enabled");
+          if (id(turbo_mode).state) id(turbo_mode).turn_off();
+          if (id(vent_fan).state && id(speed_before_night) == 0) {
+            id(speed_before_night) = id(vent_fan).speed;
+            int max_night = (int)id(night_max_speed).state;
+            auto call = id(vent_fan).turn_on();
+            call.set_speed(max_night);
+            call.perform();
+          }
+    turn_off_action:
+      - lambda: |-
+          ESP_LOGI("night_mode", "Night mode disabled");
+          if (id(speed_before_night) > 0 && id(vent_fan).state) {
+            auto call = id(vent_fan).turn_on();
+            call.set_speed(id(speed_before_night));
+            call.perform();
+          }
+          id(speed_before_night) = 0;
+
+  - platform: template
+    name: "Turbo Mode"
+    id: turbo_mode
+    icon: "mdi:rocket-launch"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    turn_on_action:
+      - lambda: |-
+          ESP_LOGI("turbo_mode", "Turbo mode enabled");
+          if (id(night_mode).state) id(night_mode).turn_off();
+          if (id(vent_fan).state && id(speed_before_turbo) == 0) {
+            id(speed_before_turbo) = id(vent_fan).speed;
+          }
+          auto call = id(vent_fan).turn_on();
+          call.set_speed(100);
+          call.perform();
+    turn_off_action:
+      - lambda: |-
+          ESP_LOGI("turbo_mode", "Turbo mode disabled");
+          if (id(speed_before_turbo) > 0) {
+            auto call = id(vent_fan).turn_on();
+            call.set_speed(id(speed_before_turbo));
+            call.perform();
+          } else {
+            id(vent_fan).turn_off();
+          }
+          id(speed_before_turbo) = 0;
+
+button:
+  - platform: restart
+    name: "ESP Restart"
+
+text_sensor:
+  - platform: template
+    name: "Fan Status"
+    icon: "mdi:information-outline"
+    lambda: |-
+      if (id(turbo_mode).state) return {"🚀 Turbo Mode"};
+      if (id(night_mode).state) return {"🌙 Night Mode"};
+      if (!id(vent_fan).state) return {"⛔ Off"};
+      return {"⚙️ Manual Control"};
+    update_interval: 5s
+
+  - platform: template
+    name: "Weather Forecast"
+    icon: "mdi:weather-partly-cloudy"
+    lambda: |-
+      float pressure = id(sea_pressure).state;
+      float trend = id(pressure_trend_1h).state;
+      float humidity = id(room_humidity).state;
+      
+      if (isnan(pressure) || isnan(humidity)) return {"No data"};
+      
+      bool pressure_rising = trend > 1.0;
+      bool pressure_falling = trend < -1.0;
+      bool pressure_rapid_fall = trend < -2.5;
+      
+      if (pressure_rapid_fall && pressure < 1005.0 && humidity > 75.0)
+        return {"⛈️ Thunderstorm likely"};
+      
+      if (pressure_falling && pressure < 1010.0 && humidity > 70.0)
+        return {"🌧️ Rain possible"};
+      
+      if (pressure_falling && humidity > 75.0)
+        return {"☁️ Weather worsening"};
+      
+      if (pressure_rising && pressure > 1020.0)
+        return {"☀️ Weather improving"};
+      
+      if (pressure > 1025.0 && humidity < 60.0)
+        return {"☀️ Clear sky"};
+      
+      if (pressure > 1020.0 && pressure < 1030.0)
+        return {"🌤️ Partly cloudy"};
+      
+      if (pressure > 1015.0 && pressure < 1025.0)
+        return {"☁️ Cloudy"};
+      
+      if (pressure < 1015.0)
+        return {"🌧️ Overcast"};
+      
+      return {"➡️ Stable"};
+    update_interval: 120s
+
+  - platform: version
+    name: "ESPHome Version"
+
+number:
+  - platform: template
+    name: "Night Mode Max Speed"
+    id: night_max_speed
+    icon: "mdi:speedometer"
+    min_value: 10
+    max_value: 100
+    step: 1
+    initial_value: 40
+    optimistic: true
+    restore_value: true
+    unit_of_measurement: "%"
+    mode: slider
+    on_value:
+      - lambda: |-
+          ESP_LOGI("settings", "Night mode max speed changed to: %.0f%%", x);
+
+interval:
+  - interval: 5s
+    then:
+      - if:
+          condition:
+            and:
+              - switch.is_on: night_mode
+              - switch.is_off: turbo_mode
+              - fan.is_on: vent_fan
+          then:
+            - lambda: |-
+                int current_speed = id(vent_fan).speed;
+                int max_night = (int)id(night_max_speed).state;
+                if (current_speed > max_night) {
+                  auto call = id(vent_fan).turn_on();
+                  call.set_speed(max_night);
+                  call.perform();
+                }
+
+  - interval: 3600s
+    then:
+      - lambda: |-
+          float current = id(atm_pressure).state;
+          if (!isnan(current)) {
+            id(pressure_1h_ago) = current;
+            ESP_LOGI("pressure", "Saved pressure for trend: %.1f hPa", current);
+          }
