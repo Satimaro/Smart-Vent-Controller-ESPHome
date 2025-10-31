@@ -1,0 +1,14 @@
+# ESPHome build cache
+.esphome/
+
+# Local settings
+secrets.yaml
+secrets.json
+
+# Python cache
+__pycache__/
+*.pyc
+
+# OS files
+.DS_Store
+Thumbs.db
